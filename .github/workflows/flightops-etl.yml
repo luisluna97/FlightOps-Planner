@@ -1,0 +1,57 @@
+name: FlightOps ETL
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SCHEMA: ${{ secrets.SUPABASE_SCHEMA }}
+      SUPABASE_VERIFY_SSL: ${{ secrets.SUPABASE_VERIFY_SSL }}
+      DEFAULT_SEASON: ${{ secrets.DEFAULT_SEASON }}
+      HTTP_TIMEOUT_SECONDS: ${{ secrets.HTTP_TIMEOUT_SECONDS }}
+      HTTP_CONCURRENCY: ${{ secrets.HTTP_CONCURRENCY }}
+      SIROS_BASE_URL: ${{ secrets.SIROS_BASE_URL }}
+      SIROS_VERIFY_SSL: ${{ secrets.SIROS_VERIFY_SSL }}
+      MIN_TURNAROUND_MINUTES: ${{ secrets.MIN_TURNAROUND_MINUTES }}
+      SOLO_OPEN_MINUTES: ${{ secrets.SOLO_OPEN_MINUTES }}
+      ROUNDING_GRANULARITY_MINUTES: ${{ secrets.ROUNDING_GRANULARITY_MINUTES }}
+      AIRPORTS_CSV_PATH: ${{ secrets.AIRPORTS_CSV_PATH }}
+      AIRPORTS_LIST: ${{ secrets.AIRPORTS_LIST }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executar ETL
+        run: |
+          AIRPORT_ARGS=""
+          for CODE in $AIRPORTS_LIST; do
+            AIRPORT_ARGS="$AIRPORT_ARGS --airport $CODE"
+          done
+
+          CSV_ARG=""
+          if [ -n "$AIRPORTS_CSV_PATH" ]; then
+            CSV_ARG="--airports-csv $AIRPORTS_CSV_PATH"
+          fi
+
+          python run_phase1.py \
+            $AIRPORT_ARGS \
+            --season ${DEFAULT_SEASON:-S25} \
+            $CSV_ARG

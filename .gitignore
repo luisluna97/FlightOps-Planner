@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.log
+*.csv
+/airports.csv
+/.idea/
+/.vscode/
+dist/
+build/
