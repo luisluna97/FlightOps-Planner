@@ -1,0 +1,49 @@
+﻿FlightOps Planner – Resumo Geral (Fase 1)
+=======================================
+
+1. Objetivo
+-----------
+Back-end para ingestão de malhas aéreas do SIROS (ANAC), casamento de voos e publicação em Supabase (ou CSV) para calcular demanda operacional de aeroportos.
+
+2. Estrutura de Código
+----------------------
+- src/flightops_planner/
+  - config.py                  → variáveis de ambiente (Supabase, SIROS, timeouts).
+  - siros_client.py             → download do SSIM, tratamento ZIP/Gzip/JSON + unicode.
+  - slot_utils.py / classifiers → arredondamentos + classificações.
+  - linker.py / pipeline.py     → casamento de voos (mín. 30 min), slots ARR/DEP, PNT/TST etc.
+  - supabase_loader.py          → upsert + limpeza (logs truncados).
+  - reference_loader.py         → importa airports.csv para aeroportos_ref.
+  - metadata.py                 → DOM/INT via aeródromos/país.
+  - logging_utils.py            → padrão de logging.
+- run_phase1.py                 → CLI orquestra ETL (env + limpeza com --replace).
+- app.py                        → FastAPI para ETL sob demanda (Render/Railway).
+- export_to_csv.py              → gerar CSV direto do SSIM com parser posicional.
+- sql/001_create_tables.sql     → schema Supabase.
+
+3. Pipeline ETL
+---------------
+- Parâmetros: --airport (ALL ou lista), --season, --airports-csv, --replace, --dry-run, --log-level.
+- Passos: baixa SIROS → parse → casamento mínimo 30 min → slots de 10 min → grava no Supabase.
+
+4. CSV direto do SIROS
+----------------------
+- `python export_to_csv.py --airport MCZ --season S25 --output-dir exports/mcz` gera `voos.csv` = 201 linhas corretas.
+- Parser usa posições fixas da linha “3” (carrier, flight, datas, aeroportos, horários, offsets, equipamento).
+
+5. Supabase
+-----------
+- `sql/001_create_tables.sql` cria voos_raw/tratados/slots/... .
+- Supabase client com verify opcional (SUPABASE_VERIFY_SSL).
+- `--replace` limpa aeroportos antes de gravar.
+
+6. Hospedagem / Automação
+-------------------------
+- Render/Railway: expor `app.py` (POST /etl). Opcional cron job.
+- GitHub Actions (workflow pronto) se quiser rodar diariamente.
+
+7. Próximos Passos
+------------------
+- Integrar front → chamar API (Render) quando usuário trocar de aeroporto.
+- Criar views/Edge Functions no Supabase conforme telas.
+- Manter export_to_csv.py como fallback para análises offline.

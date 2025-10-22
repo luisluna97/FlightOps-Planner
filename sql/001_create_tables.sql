@@ -77,10 +77,18 @@ create table if not exists slots_solo (
     classe_aeronave text not null,
     dom_int text,
     pnt_tst text,
+    atendimento_embarque_desembarque boolean not null default false,
+    atendimento_limpeza boolean not null default false,
     primary key (voo_id, slot_ts)
 );
 
 create index if not exists idx_slots_solo_main on slots_solo (slot_ts, aeroporto, temporada, cia);
+
+alter table if exists slots_solo
+    add column if not exists atendimento_embarque_desembarque boolean not null default false;
+
+alter table if exists slots_solo
+    add column if not exists atendimento_limpeza boolean not null default false;
 
 create table if not exists param_staff_por_classe (
     classe_aeronave text primary key,
@@ -110,3 +118,110 @@ create table if not exists aeroportos_ref (
 
 create unique index if not exists uq_aeroportos_ref_iata on aeroportos_ref (iata) where iata is not null;
 create unique index if not exists uq_aeroportos_ref_icao on aeroportos_ref (icao) where icao is not null;
+
+-- Visões de apoio para análises operacionais
+
+create or replace view vw_voos_por_semana as
+select
+    aeroporto,
+    temporada,
+    date_trunc('week', chegada_slot) as semana_inicio,
+    count(*) as total_voos
+from voos_tratados
+group by aeroporto, temporada, semana_inicio;
+
+create or replace view vw_semana_pico_por_aeroporto as
+select distinct on (aeroporto, temporada)
+    aeroporto,
+    temporada,
+    semana_inicio,
+    total_voos
+from vw_voos_por_semana
+order by aeroporto, temporada, total_voos desc;
+
+create or replace view vw_dim_slot_10min as
+with limites as (
+    select
+        min(chegada_slot) as inicio,
+        max(coalesce(partida_slot, chegada_slot)) as fim
+    from voos_tratados
+    where chegada_slot is not null
+)
+select generate_series(inicio, fim, interval '10 minutes') as slot_ts
+from limites
+where inicio is not null and fim is not null;
+
+create or replace view vw_dim_slot_hora as
+select distinct date_trunc('hour', slot_ts) as hora
+from vw_dim_slot_10min;
+
+drop function if exists delete_airport_temporada(text, text);
+drop function if exists delete_airport_temporada(text, text, integer);
+drop function if exists delete_airport_temporada_step(text, text, integer);
+
+create or replace function delete_airport_temporada_step(
+    p_aeroporto text,
+    p_temporada text,
+    p_batch integer default 5000
+)
+returns text
+language plpgsql
+as $$
+declare
+    affected integer;
+begin
+    delete from slots_atendimento
+    where ctid in (
+        select ctid
+        from slots_atendimento
+        where aeroporto = p_aeroporto
+          and (p_temporada is null or temporada = p_temporada)
+        limit p_batch
+    );
+    GET DIAGNOSTICS affected = ROW_COUNT;
+    if affected > 0 then
+        return 'slots_atendimento';
+    end if;
+
+    delete from slots_solo
+    where ctid in (
+        select ctid
+        from slots_solo
+        where aeroporto = p_aeroporto
+          and (p_temporada is null or temporada = p_temporada)
+        limit p_batch
+    );
+    GET DIAGNOSTICS affected = ROW_COUNT;
+    if affected > 0 then
+        return 'slots_solo';
+    end if;
+
+    delete from voos_tratados
+    where ctid in (
+        select ctid
+        from voos_tratados
+        where aeroporto = p_aeroporto
+          and (p_temporada is null or temporada = p_temporada)
+        limit p_batch
+    );
+    GET DIAGNOSTICS affected = ROW_COUNT;
+    if affected > 0 then
+        return 'voos_tratados';
+    end if;
+
+    delete from voos_raw
+    where ctid in (
+        select ctid
+        from voos_raw
+        where aeroporto_operacao = p_aeroporto
+          and (p_temporada is null or temporada = p_temporada)
+        limit p_batch
+    );
+    GET DIAGNOSTICS affected = ROW_COUNT;
+    if affected > 0 then
+        return 'voos_raw';
+    end if;
+
+    return null;
+end;
+$$;

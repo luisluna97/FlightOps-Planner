@@ -1,0 +1,250 @@
+FlightOps Planner – Visão Geral e Integração com o Front-end
+===========================================================
+
+1. Objetivo Geral
+-----------------
+O FlightOps Planner consolida e normaliza a malha SIROS (ANAC) para alimentar indicadores operacionais de aeroportos. A solução atual cobre:
+
+* Download/parsing do SIROS (SSIM textual ou CSV).
+* Casamento de chegadas/partidas por aeroporto, com arredondamento em slots de 10 minutos.
+* Classificação de aeronaves (WIDE, NARROW, ATR, etc.), incluindo regras especiais (A321, GOL_MELI, CARGO).
+* Expansão de slots de atendimento (ARR/DEP) e solo (limpeza/embarque).
+* Persistência em Supabase via upsert (tabelas normalizadas + views auxiliares).
+* CLI/ETL com filtros por aeroporto, temporada, mês (com opção de incluir o mês anterior) e recortes seletivos.
+
+O front deverá consumir esses dados para fornecer heatmaps, gráficos de simultaneidade e dimensionamento de equipes.
+
+2. Fluxo do Pipeline
+--------------------
+1. **Entrada (run_phase1.py)**  
+   Parâmetros principais:
+   * `--airport` (pode repetir, ou `ALL` para tudo).
+   * `--month YYYY-MM` (filtra o processamento para um mês específico; formato UTC).
+   * `--include-prev-month` (inclui o mês anterior, útil para comparativos).
+   * `--season` (opcional, é inferido automaticamente quando `--month` é usado).
+   * `--airports-csv` (opcional, recarrega referência de aeroportos antes do ETL).
+   * `--dry-run` (processa sem gravar).
+   * `--replace` (remove dados existentes do aeroporto/temporada/janela antes de gravar).
+
+2. **Download (siros_client.py)**  
+   Detecta payload (texto puro, ZIP, gzip, JSON encapsulado) e converte para string.  
+   Novo suporte: service_type (`F`, `M`, `C`, `G`, etc.) + natureza “CARGO” quando apropriado.
+
+3. **Parsing (siros_parser.py)**  
+   Detecta se o arquivo é SSIM. Para SSIM:
+   * Converte registros “linha 3” em DataFrame diário.
+   * Gera `service_type`, `natureza`, `assentos_previstos`.
+   * Retém datas (UTC), equip, cia, temporada, etc.
+   Para CSVs, usa alias para padronizar colunas.
+
+4. **Janela temporal (pipeline.py)**  
+   * Converte `window_start/window_end` para UTC.
+   * Filtra voos com chegada/partida dentro da janela (inclui voos que cruzam o limite inicial).
+   * Gera UUIDs estáveis (`flight_id` + `event_id`).
+   * Determina lista de aeroportos (via parâmetro ou derivado do dataset).
+
+5. **Linkagem (linker.py)**  
+   * Associa chegada/partida por aeroporto (`min_turnaround_minutes`, slot de 10 min).
+   * Calcula `solo_min`, `pnt_tst`, `dom_int`.
+   * Classificação especial:
+     * `A321`: códigos `321`, `32R`.
+     * `GOL_MELI`: cia G3 + (`service_type` F/M/C/G ou equipamento 73C/73M, ou `assentos_previstos <= 50`).
+     * `CARGO`: service_type F/M/C/G (não-GOL) ou act_type terminando com “F”.
+   * Expande slots de atendimento (`expand_slots`) e slots de solo (`slot_range`), aplicando flags:
+     * `atendimento_embarque_desembarque`: 10 min antes da chegada → 30 min depois; 30 min antes da partida → 10 min depois (ou toda permanência se turnaround menor).
+     * `atendimento_limpeza`: 10 min antes → 10 min depois da chegada.
+
+6. **Persistência (supabase_loader.py)**  
+   * `delete_airport_data`: remove registros existentes filtrando por aeroporto, temporada e janela temporal (quando presente).
+   * `upsert_dataframe`: grava em Supabase em lotes (padrão 500 registros).
+   * Conjuntos gravados:
+     * `voos_raw` – eventos individuais.
+     * `voos_tratados` – pares ARR/DEP.
+     * `slots_atendimento` – slots ARR/DEP, com fase, cia, classe, etc.
+     * `slots_solo` – slots de solo com flags de embarque/limpeza.
+
+3. Estrutura no Supabase
+------------------------
+### Tabelas Principais
+1. `voos_raw`
+   * Eventos ARR/DEP (UUIDs estáveis).
+   * Campos: `event_id`, `flight_id`, `temporada`, `cia`, `numero_voo`, `act_type`, `origem`, `destino`, `aeroporto_operacao`, `evento`, `timestamp_evento`, `dt_partida_utc`, `dt_chegada_utc`, `natureza`, `assentos_previstos`, `payload`.
+   * Índices: por aeroporto/temporada/cia, e `flight_id+evento+aeroporto`.
+
+2. `voos_tratados`
+   * Resultado do casamento ARR/DEP com slots arredondados e métricas.
+   * Inclui `classe_aeronave`, `solo_min`, flags de link, `arrival/departure_event_id`, etc.
+   * Índices: `aeroporto+temporada+cia`, `chegada_slot`.
+
+3. `slots_atendimento`
+   * Cada linha = slot de 10 min (fase ARR/DEP) com `voo_id`, `slot_ts`, `cia`, `classe_aeronave`, `dom_int`, `pnt_tst`, `numero_voo`.
+   * Chave primária: `(voo_id, slot_ts, fase)`.
+
+4. `slots_solo`
+   * Slots de solo por `voo_id`, com `atendimento_embarque_desembarque` e `atendimento_limpeza`.
+   * Chave primária: `(voo_id, slot_ts)`.
+
+5. `param_staff_por_classe`
+   * Parâmetros operacionais por classe (ASG, Aux Líder, ASA, etc.).
+   * Seed default disponível em `sql/010_seed_param_staff.sql`.
+
+6. `aeroportos_ref`
+   * Dados OurAirports (códigos, nome, país, tz etc.), usada para DOM/INT.
+
+### Views/Auxiliares
+1. `vw_voos_por_semana`: total de voos por `aeroporto`, `temporada`, início da semana (`date_trunc('week', chegada_slot)`).
+2. `vw_semana_pico_por_aeroporto`: semana de maior volume por aeroporto/temporada (usa DISTINCT ON).
+3. `vw_dim_slot_10min`: gera uma série contínua de slots 10 min entre o menor `chegada_slot` e o maior `partida_slot` presente.
+4. `vw_dim_slot_hora`: derivado (unique `date_trunc('hour', slot_ts)`), útil para eixos de gráficos.
+
+4. Integração com o Front-end
+----------------------------
+### Filtros/Entrada do Front
+1. **Aeroporto** (obrigatório).
+2. **Mês (YYYY-MM)**: valor principal, com opção de incluir o mês anterior (comparação).
+3. **CIA(s)**: seletor multi (default “todas”).
+4. **Semana**: default = semana de maior volume (consultar `vw_semana_pico_por_aeroporto` filtrando pelo mês). Usuário pode escolher outra semana do próprio mês.
+
+### Queries/Outputs sugeridos
+1. **Resumo por companhia / classe** (confirma “GOL_MELI”):
+   ```sql
+   select cia, classe_aeronave, count(*) total_voos
+   from voos_tratados
+   where aeroporto = :airport
+     and date_trunc('month', chegada_slot) = :month
+     and (not :filter_prev_month or chegada_slot >= :prev_month_start)
+     and (:cia_list is null or cia = any(:cia_list))
+   group by cia, classe_aeronave
+   order by cia, classe_aeronave;
+   ```
+
+2. **Heatmap de Atendimento (10 min)**  
+   Usar `slots_atendimento`. Eixo X = slots (10 min), eixo Y = dias da semana.  
+   ```sql
+   select
+       date_trunc('day', slot_ts) as dia,
+       slot_ts,
+       fase,
+       sum(case when atendimento.fase = 'ARR' then 1 else 0 end) as qtd_arr,
+       sum(case when atendimento.fase = 'DEP' then 1 else 0 end) as qtd_dep
+   from slots_atendimento atendimento
+   join voos_tratados vt using (voo_id)
+   where atendimento.aeroporto = :airport
+     and atendimento.slot_ts >= :window_start
+     and atendimento.slot_ts < :window_end
+     and (:cia_list is null or atendimento.cia = any(:cia_list))
+   group by dia, slot_ts, fase;
+   ```
+   Para heatmap consolidado, somar `ARR+DEP` e pivotar por fase/dia.
+
+3. **Heatmap de Limpeza / Solo**  
+   `slots_solo` já traz `atendimento_embarque_desembarque` e `atendimento_limpeza`.  
+   ```sql
+   select
+       date_trunc('day', slot_ts) as dia,
+       slot_ts,
+       sum(case when atendimento_embarque_desembarque then 1 else 0 end) as qtd_embarque,
+       sum(case when atendimento_limpeza then 1 else 0 end) as qtd_limpeza
+   from slots_solo
+   where aeroporto = :airport
+     and slot_ts >= :window_start
+     and slot_ts < :window_end
+     and (:cia_list is null or cia = any(:cia_list))
+   group by dia, slot_ts;
+   ```
+
+4. **Dimensionamento de Equipes (Headcount)**  
+   Para cada slot, cruzar com `param_staff_por_classe`:
+   ```sql
+   with slots as (
+       select slot_ts, classe_aeronave, sum(case when atendimento_embarque_desembarque then 1 else 0 end) as qtd_at
+       from slots_solo
+       where aeroporto = :airport
+         and slot_ts >= :window_start
+         and slot_ts < :window_end
+       group by slot_ts, classe_aeronave
+   )
+   select
+       slot_ts,
+       sum(qtd_at * p.asg) as total_asg,
+       sum(qtd_at * p.aux_lider) as total_aux_lider,
+       sum(qtd_at * p.asa_rampa) as total_asa_rampa,
+       sum(qtd_at * p.asa_triagem) as total_asa_triagem,
+       sum(qtd_at * p.asa_desemb) as total_asa_desemb,
+       sum(qtd_at * p.oper_equip) as total_oper_equip
+   from slots
+   join param_staff_por_classe p on p.classe_aeronave = slots.classe_aeronave
+   group by slot_ts
+   order by slot_ts;
+   ```
+   O front pode transformar isso em curva horária ou highlight do pico.
+
+5. **Seletor de Semana**  
+   ```sql
+   select semana_inicio
+   from vw_voos_por_semana
+   where aeroporto = :airport
+     and temporada = :season
+     and semana_inicio >= :window_start
+     and semana_inicio < :window_end
+   order by semana_inicio;
+   ```
+   O default vem de `vw_semana_pico_por_aeroporto`.
+
+### Experiência do Usuário
+* O front chama a API (Railway) para:
+  1. Disparar o ETL `POST /etl` (quando quiser atualizar Supabase). Já existe `app.py`.
+  2. Consultar endpoints de leitura: `GET /heatmap`, `GET /slots`, `GET /resumo`, etc. (a criar) que encapsulam as queries acima, aplicando os filtros (airport, month, cia, semana).
+
+5. API e Deploy no Railway
+--------------------------
+### app.py
+* Já expõe `POST /etl` (usa `run_phase1.main([...])`).
+* Próximo passo: criar endpoints REST para leitura (ex.: `GET /summary`, `GET /heatmap`, `GET /staffing`).
+* Cada endpoint deve:
+  * Validar parâmetros do front (airport, month, include_prev, cia list, semana opcional).
+  * Montar queries usando Supabase client (`supabase.table(...).select(...).eq(...)`).
+  * Retornar JSON pronto para os gráficos (por exemplo, arrays de slots/dias, valores agregados e metadados de eixos).
+
+### Railway
+1. Criar serviço Python com `app.py` (FastAPI + Uvicorn).
+2. Configurar variáveis de ambiente (mesmas do `.env`), inclusive `SUPABASE_VERIFY_SSL`, `SIROS_VERIFY_SSL`, etc.
+3. Expor os endpoints:
+   * `POST /etl` – roda ETL (com parâmetros default; podemos permitir query params para mês/airports).
+   * `GET /summary` – resumo por companhia/classe.
+   * `GET /slots` – heatmap de atendimento e solo.
+   * `GET /staff` – headcount por slot.
+   * `GET /weeks` – lista de semanas disponíveis e semana pico (para o seletor).
+4. Autenticar/autorizar (pode usar um token simples via header, já que o front está em ambiente controlado).
+5. Workflow no front:
+   * Usuário escolhe filtros → front chama GET nos endpoints → monta heatmap/gráficos.
+   * Botão “Atualizar dados” → front chama POST `/etl` (retorna status “in progress”); após completar, front reconsulta os GETs.
+
+6. Considerações Adicionais
+---------------------------
+* **Assentos prévios vs carga**: as regras especiais (<= 50 assentos, service_type cargueiro, equipamentos 73C/73M) garantem que voos tipo GLO/9627 sejam classificados como `GOL_MELI`, mesmo sem TOT linhas. Certifique-se de que `assentos_previstos` do SIROS (ou valor default) está trafegando no Supabase.
+* **Filtros por CIA**: `slots_atendimento` e `slots_solo` já guardam `cia`. Para filtros multi-cia, use `where cia = any(:array)` ou `in (...)`.
+* **Semana atual vs janela**: se o front filtra por mês, deve recortar as views/tabelas pelo mesmo intervalo (`slot_ts between window_start and window_end`). A view `vw_semana_pico` é baseada na temporada inteira – por isso uso filtros extras na query.
+* **Performance**: `slots_solo` pode ter > 300k linhas por aeroporto/mês. Recomenda-se:
+  * Índices: já existem (`slot_ts`, `aeroporto`, `temporada`).
+  * Consultas paginadas ou agregadas (evitar SELECT * sem filtros).
+  * Em endpoints, sempre reduzir a janela temporal (usar `window_start`/`window_end`).
+
+7. Checklist antes do Deploy
+----------------------------
+1. Rodar ETL localmente com `--month` para os aeroportos foco (e validar no Supabase os campos `classe_aeronave`, `atendimento_*`, `param_staff`).
+2. Executar `sql/010_seed_param_staff.sql` no Supabase para garantir os coeficientes.
+3. Implementar endpoints de leitura no `app.py` (após confirmação da estrutura).  
+4. Criar repositório/branch com Dockerfile ou `Procfile` para Railway (Uvicorn).  
+5. Configurar `requirements.txt` (já pronto).  
+6. Lembrar de ativar `SIROS_VERIFY_SSL=false` se usar rede com interceptação.
+
+8. Próximos Passos (a combinar)
+------------------------------
+* Acrescentar endpoints REST na API (heatmap, staff, semana pico).
+* Preparar pipeline CI/CD para Railway (deploy automático).
+* Ajustar front-end (v0.dev ou similar) para consumir os endpoints e renderizar heatmaps/curvas.
+* Opcional: agendar cron jobs no Railway/GitHub Actions para executar ETL em horários específicos.
+
+Qualquer dúvida adicional sobre filtros, estrutura ou integração, só avisar!
+

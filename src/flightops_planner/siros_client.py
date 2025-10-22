@@ -9,6 +9,7 @@ string ready for downstream parsing.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import zipfile
 from typing import Optional
@@ -101,7 +102,40 @@ def fetch_schedule(season: str, *, timeout: Optional[float] = None) -> str:
         ) from exc
 
     logger.debug("Download concluído (%s bytes).", len(response.content))
-    return _decode_payload(response.content)
+    text = _decode_payload(response.content)
+
+    stripped = text.strip()
+    if stripped.startswith('"') and stripped.endswith('"'):
+        stripped = stripped[1:-1]
+
+    try:
+        stripped = stripped.encode('utf-8').decode('unicode_escape')
+    except Exception:
+        pass
+
+    if stripped.startswith('[') and 'ssimfile' in stripped:
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, list):
+                parts = []
+                for item in data:
+                    if isinstance(item, dict):
+                        part = item.get('ssimfile')
+                    else:
+                        part = None
+                    if part:
+                        parts.append(part)
+                if parts:
+                    text = "\n".join(parts)
+                    logger.debug(
+                        "SSIM recebido em formato JSON; convertido para texto (%s linhas).",
+                        len(parts),
+                    )
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Falha ao interpretar payload JSON: %s", exc)
+
+    return text
+
 
 
 __all__ = ["fetch_schedule", "SirosDownloadError"]

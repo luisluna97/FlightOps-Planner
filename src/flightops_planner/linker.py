@@ -35,6 +35,35 @@ def _generate_voo_id(season: str, airport: str, arrival_id: str, departure_id: O
     return str(uuid5(NAMESPACE_URL, key))
 
 
+def _slot_overlaps(
+    slot_ts: pd.Timestamp,
+    *,
+    minutes: int,
+    window_start: Optional[pd.Timestamp],
+    window_end: Optional[pd.Timestamp],
+) -> bool:
+    if pd.isna(slot_ts) or window_start is None or window_end is None:
+        return False
+    slot_end = slot_ts + timedelta(minutes=minutes)
+    if window_end <= window_start:
+        return False
+    return slot_ts < window_end and slot_end > window_start
+
+
+def _merge_spans(spans: List[Tuple[pd.Timestamp, pd.Timestamp]]) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    merged: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    for start, end in sorted(spans, key=lambda pair: pair[0]):
+        if not merged:
+            merged.append((start, end))
+            continue
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _prepare_events(frame: DataFrame, airport: str) -> Tuple[DataFrame, DataFrame]:
     arrivals = frame.loc[frame["destino"] == airport].copy()
     departures = frame.loc[frame["origem"] == airport].copy()
@@ -176,7 +205,16 @@ def link_airport(
             partida_slot = pd.NaT
             solo_minutes = settings.solo_open_minutes
 
-        classe = classify_aircraft(arrival["act_type"], is_cargo=False)
+        service_type = arrival.get("service_type")
+        natureza = (str(arrival.get("natureza") or "")).strip().upper()
+        is_cargo_flag = natureza in {"CARGO", "CARGA"}
+        classe = classify_aircraft(
+            arrival["act_type"],
+            is_cargo=is_cargo_flag,
+            cia=arrival.get("cia"),
+            service_type=service_type,
+            assentos_previstos=arrival.get("assentos_previstos"),
+        )
         dom_int = classify_domestic(
             arrival["origem"],
             destino,
@@ -262,7 +300,66 @@ def link_airport(
                 arrival_time + timedelta(minutes=settings.solo_open_minutes),
                 minutes=slot_minutes,
             )
-        for slot in slot_range(chegada_slot, solo_end, minutes=slot_minutes):
+        arrival_window_start = arrival_time - timedelta(minutes=10)
+        arrival_window_end = arrival_time + timedelta(minutes=30)
+        limpeza_window_start = arrival_time - timedelta(minutes=10)
+        limpeza_window_end = arrival_time + timedelta(minutes=10)
+
+        departure_window_start: Optional[pd.Timestamp] = None
+        departure_window_end: Optional[pd.Timestamp] = None
+
+        if isinstance(departure_time, pd.Timestamp) and not pd.isna(departure_time):
+            departure_window_start = departure_time - timedelta(minutes=30)
+            departure_window_end = departure_time + timedelta(minutes=10)
+
+        full_attendance = False
+        if isinstance(departure_time, pd.Timestamp) and not pd.isna(departure_time):
+            ground_start = arrival_time
+            ground_end = departure_time
+            if ground_end > ground_start:
+                spans: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+                arr_start = max(arrival_window_start, ground_start)
+                arr_end = min(arrival_window_end, ground_end)
+                if arr_end > arr_start:
+                    spans.append((arr_start, arr_end))
+                if departure_window_start is not None and departure_window_end is not None:
+                    dep_start = max(departure_window_start, ground_start)
+                    dep_end = min(departure_window_end, ground_end)
+                    if dep_end > dep_start:
+                        spans.append((dep_start, dep_end))
+
+                merged = _merge_spans(spans)
+                covered = sum((end - start for start, end in merged), timedelta(0))
+                ground_duration = ground_end - ground_start
+                if covered >= ground_duration - timedelta(minutes=1):
+                    full_attendance = True
+
+        solo_slots = slot_range(chegada_slot, solo_end, minutes=slot_minutes)
+        for slot in solo_slots:
+            is_embarque_desembarque = full_attendance or _slot_overlaps(
+                slot,
+                minutes=slot_minutes,
+                window_start=arrival_window_start,
+                window_end=arrival_window_end,
+            )
+            if (
+                not is_embarque_desembarque
+                and departure_window_start is not None
+                and departure_window_end is not None
+            ):
+                is_embarque_desembarque = _slot_overlaps(
+                    slot,
+                    minutes=slot_minutes,
+                    window_start=departure_window_start,
+                    window_end=departure_window_end,
+                )
+            is_limpeza = _slot_overlaps(
+                slot,
+                minutes=slot_minutes,
+                window_start=limpeza_window_start,
+                window_end=limpeza_window_end,
+            )
+
             solo_rows.append(
                 {
                     "voo_id": voo_id,
@@ -273,12 +370,28 @@ def link_airport(
                     "classe_aeronave": classe,
                     "dom_int": dom_int,
                     "pnt_tst": pnt_tst,
+                    "atendimento_embarque_desembarque": bool(is_embarque_desembarque),
+                    "atendimento_limpeza": bool(is_limpeza),
                 }
             )
 
     treated_df = pd.DataFrame(treated_rows)
     atendimento_df = pd.DataFrame(atendimento_rows)
-    solo_df = pd.DataFrame(solo_rows)
+    solo_df = pd.DataFrame(
+        solo_rows,
+        columns=[
+            "voo_id",
+            "slot_ts",
+            "temporada",
+            "aeroporto",
+            "cia",
+            "classe_aeronave",
+            "dom_int",
+            "pnt_tst",
+            "atendimento_embarque_desembarque",
+            "atendimento_limpeza",
+        ],
+    )
 
     raw_subset = pd.concat([arrivals, departures], ignore_index=True, axis=0)
     raw_subset["aeroporto_operacao"] = airport

@@ -53,6 +53,8 @@ def run_pipeline(
     aeroportos: Optional[Iterable[str]],
     airport_country_map: Optional[Dict[str, str]] = None,
     schedule_text_override: Optional[str] = None,
+    window_start: Optional[pd.Timestamp] = None,
+    window_end: Optional[pd.Timestamp] = None,
 ) -> PipelineResult:
     """
     Execute the Phase 1 processing: download SIROS, parse, link flights,
@@ -69,9 +71,55 @@ def run_pipeline(
     else:
         schedule_text = fetch_schedule(season)
 
+    if window_start is not None:
+        window_start = pd.Timestamp(window_start)
+        if window_start.tz is None:
+            window_start = window_start.tz_localize('UTC')
+        else:
+            window_start = window_start.tz_convert('UTC')
+    if window_end is not None:
+        window_end = pd.Timestamp(window_end)
+        if window_end.tz is None:
+            window_end = window_end.tz_localize('UTC')
+        else:
+            window_end = window_end.tz_convert('UTC')
+
     raw_frame = parse_schedule_text(schedule_text)
     if "temporada" not in raw_frame.columns or raw_frame["temporada"].isna().all():
         raw_frame["temporada"] = season
+
+    if window_start or window_end:
+        arrival_ts = raw_frame.get("dt_chegada_utc")
+        departure_ts = raw_frame.get("dt_partida_utc")
+
+        def _in_window(series: pd.Series) -> pd.Series:
+            cond = pd.Series(True, index=series.index)
+            if window_start is not None:
+                cond &= series >= window_start
+            if window_end is not None:
+                cond &= series < window_end
+            cond &= ~series.isna()
+            return cond
+
+        mask = pd.Series(False, index=raw_frame.index)
+        if arrival_ts is not None:
+            mask |= _in_window(arrival_ts)
+        if departure_ts is not None:
+            mask |= _in_window(departure_ts)
+
+        # Include flights overlapping the start boundary (arrival before start but departure inside window)
+        if window_start is not None and departure_ts is not None and arrival_ts is not None:
+            overlap = (
+                arrival_ts.notna()
+                & departure_ts.notna()
+                & (arrival_ts < window_start)
+                & (departure_ts >= window_start)
+            )
+            if window_end is not None:
+                overlap &= departure_ts < window_end
+            mask |= overlap
+
+        raw_frame = raw_frame.loc[mask].reset_index(drop=True)
 
     raw_frame = _assign_raw_ids(raw_frame, season)
 

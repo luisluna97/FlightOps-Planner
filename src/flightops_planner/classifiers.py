@@ -4,7 +4,7 @@ Domain-specific classification helpers.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import pandas as pd
 
@@ -30,9 +30,20 @@ WIDE_BODY_TYPES = {
 NARROW_BODY_PREFIXES = ("73", "32", "E19", "E17", "E18", "E14", "B73")
 ATR_PREFIXES = ("ATR", "AT4", "AT7")
 LIGHT_PREFIXES = ("C", "P", "BE", "SR", "TB", "PA")
+A321_CODES = {"321", "32R"}
+GOL_MELI_EQUIPMENT = {"73C", "73M"}
+GOL_CARGO_CIAS = {"G3"}
+CARGO_SERVICE_TYPES = {"F", "M", "C", "G"}
 
 
-def classify_aircraft(act_type: str, *, is_cargo: bool = False) -> str:
+def classify_aircraft(
+    act_type: str,
+    *,
+    is_cargo: bool = False,
+    cia: Optional[str] = None,
+    service_type: Optional[str] = None,
+    assentos_previstos: Optional[Union[int, float, str]] = None,
+) -> str:
     """
     Classify an aircraft type into buckets (WIDE, NARROW, ATR, CARGO, MELI, CESNNA).
     """
@@ -41,11 +52,27 @@ def classify_aircraft(act_type: str, *, is_cargo: bool = False) -> str:
     if not code:
         return "UNKNOWN"
 
-    if is_cargo or code.endswith("F"):
+    carrier = (cia or "").strip().upper()
+    svc = (service_type or "").strip().upper()
+
+    cargo_flag = is_cargo or code.endswith("F") or svc in CARGO_SERVICE_TYPES
+
+    seat_count: Optional[int] = None
+    if assentos_previstos is not None and not pd.isna(assentos_previstos):
+        try:
+            seat_count = int(float(assentos_previstos))
+        except (TypeError, ValueError):
+            seat_count = None
+
+    if carrier in GOL_CARGO_CIAS:
+        if code in GOL_MELI_EQUIPMENT or cargo_flag or (seat_count is not None and seat_count <= 50):
+            return "GOL_MELI"
+
+    if cargo_flag:
         return "CARGO"
 
-    if code in {"73C", "73M", "MELI"}:
-        return "MELI"
+    if code in A321_CODES:
+        return "A321"
 
     if any(code.startswith(prefix) for prefix in ATR_PREFIXES):
         return "ATR"
